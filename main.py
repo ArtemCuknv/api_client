@@ -11,7 +11,6 @@ from urllib import error, parse, request
 
 
 HTTP_METHODS = ("get", "post", "put", "patch", "delete", "options", "head")
-AUTH_MODES = ("none", "basic", "bearer", "header", "query")
 PROMPT_LINE_OFFSET = 2
 RESPONSE_SCROLL_STEP = 5
 
@@ -32,6 +31,15 @@ class RequestBodySpec:
 
 
 @dataclass(slots=True)
+class AuthFieldSpec:
+	key: str
+	label: str
+	kind: str
+	scheme_name: str
+	target_name: str = ""
+
+
+@dataclass(slots=True)
 class Operation:
 	method: str
 	path: str
@@ -40,37 +48,11 @@ class Operation:
 	operation_id: str
 	parameters: list[ParameterSpec] = field(default_factory=list)
 	request_body: RequestBodySpec | None = None
+	auth_fields: list[AuthFieldSpec] = field(default_factory=list)
 
 	@property
 	def key(self) -> str:
 		return f"{self.method.upper()} {self.path}"
-
-
-@dataclass(slots=True)
-class AuthSettings:
-	mode: str = "none"
-	username: str = ""
-	password: str = ""
-	token: str = ""
-	header_name: str = "Authorization"
-	header_value: str = ""
-	query_name: str = "api_key"
-	query_value: str = ""
-
-	def summary(self) -> str:
-		if self.mode == "basic":
-			return f"basic ({self.username or 'no user'})"
-		if self.mode == "bearer":
-			return "bearer" if self.token else "bearer (empty token)"
-		if self.mode == "header":
-			if self.header_name and self.header_value:
-				return f"header {self.header_name}"
-			return "header (incomplete)"
-		if self.mode == "query":
-			if self.query_name and self.query_value:
-				return f"query {self.query_name}"
-			return "query (incomplete)"
-		return "none"
 
 
 @dataclass(slots=True)
@@ -167,23 +149,94 @@ def fetch_openapi_document(spec_url: str) -> dict[str, Any]:
 	return json.loads(payload.decode("utf-8"))
 
 
-def pick_default_auth_mode(document: dict[str, Any]) -> str:
-	schemes = document.get("components", {}).get("securitySchemes", {})
-	for scheme in schemes.values():
-		scheme_type = scheme.get("type")
-		if scheme_type == "http":
-			http_scheme = (scheme.get("scheme") or "").lower()
-			if http_scheme == "basic":
-				return "basic"
-			if http_scheme == "bearer":
-				return "bearer"
-		if scheme_type == "apiKey":
-			where = (scheme.get("in") or "").lower()
-			if where == "header":
-				return "header"
-			if where == "query":
-				return "query"
-	return "none"
+def parse_auth_fields(
+	raw_security: Any,
+	security_schemes: dict[str, Any],
+) -> list[AuthFieldSpec]:
+	if not isinstance(raw_security, list):
+		return []
+
+	fields: dict[str, AuthFieldSpec] = {}
+	for requirement in raw_security:
+		if not isinstance(requirement, dict):
+			continue
+		for scheme_name in requirement:
+			scheme = security_schemes.get(scheme_name)
+			if not isinstance(scheme, dict):
+				continue
+			scheme_type = (scheme.get("type") or "").lower()
+			if scheme_type == "http":
+				http_scheme = (scheme.get("scheme") or "").lower()
+				if http_scheme == "basic":
+					username_key = f"auth:{scheme_name}:username"
+					password_key = f"auth:{scheme_name}:password"
+					fields.setdefault(
+						username_key,
+						AuthFieldSpec(
+							key=username_key,
+							label=f"auth basic username ({scheme_name})",
+							kind="basic_username",
+							scheme_name=scheme_name,
+						),
+					)
+					fields.setdefault(
+						password_key,
+						AuthFieldSpec(
+							key=password_key,
+							label=f"auth basic password ({scheme_name})",
+							kind="basic_password",
+							scheme_name=scheme_name,
+						),
+					)
+				elif http_scheme == "bearer":
+					token_key = f"auth:{scheme_name}:token"
+					fields.setdefault(
+						token_key,
+						AuthFieldSpec(
+							key=token_key,
+							label=f"auth bearer token ({scheme_name})",
+							kind="bearer_token",
+							scheme_name=scheme_name,
+						),
+					)
+			elif scheme_type == "apikey":
+				target_name = str(scheme.get("name") or scheme_name)
+				target_in = (scheme.get("in") or "").lower()
+				value_key = f"auth:{scheme_name}:value"
+				if target_in == "header":
+					fields.setdefault(
+						value_key,
+						AuthFieldSpec(
+							key=value_key,
+							label=f"auth header {target_name} ({scheme_name})",
+							kind="api_key_header",
+							scheme_name=scheme_name,
+							target_name=target_name,
+						),
+					)
+				elif target_in == "query":
+					fields.setdefault(
+						value_key,
+						AuthFieldSpec(
+							key=value_key,
+							label=f"auth query {target_name} ({scheme_name})",
+							kind="api_key_query",
+							scheme_name=scheme_name,
+							target_name=target_name,
+						),
+					)
+				elif target_in == "cookie":
+					fields.setdefault(
+						value_key,
+						AuthFieldSpec(
+							key=value_key,
+							label=f"auth cookie {target_name} ({scheme_name})",
+							kind="api_key_cookie",
+							scheme_name=scheme_name,
+							target_name=target_name,
+						),
+					)
+	return list(fields.values())
 
 
 def resolve_request_base(document: dict[str, Any], spec_url: str, fallback_url: str) -> str:
@@ -233,6 +286,8 @@ def parse_request_body(raw_body: dict[str, Any]) -> RequestBodySpec | None:
 def parse_operations(document: dict[str, Any]) -> list[Operation]:
 	operations: list[Operation] = []
 	paths = document.get("paths") or {}
+	security_schemes = document.get("components", {}).get("securitySchemes", {})
+	global_security = document.get("security")
 	for path, path_item in paths.items():
 		if not isinstance(path_item, dict):
 			continue
@@ -242,6 +297,8 @@ def parse_operations(document: dict[str, Any]) -> list[Operation]:
 			if not isinstance(raw_operation, dict):
 				continue
 			raw_parameters = list(shared_parameters) + list(raw_operation.get("parameters") or [])
+			operation_security = raw_operation.get("security")
+			resolved_security = global_security if operation_security is None else operation_security
 			summary = (
 				raw_operation.get("summary")
 				or raw_operation.get("operationId")
@@ -257,6 +314,7 @@ def parse_operations(document: dict[str, Any]) -> list[Operation]:
 					operation_id=raw_operation.get("operationId") or summary,
 					parameters=parse_parameters(raw_parameters),
 					request_body=parse_request_body(raw_operation.get("requestBody") or {}),
+					auth_fields=parse_auth_fields(resolved_security, security_schemes),
 				)
 			)
 	operations.sort(key=lambda item: (item.path, item.method))
@@ -277,7 +335,6 @@ def prepare_request(
 	base_url: str,
 	operation: Operation,
 	values: dict[str, str],
-	auth: AuthSettings,
 ) -> tuple[str, dict[str, str], bytes | None]:
 	path = operation.path
 	query_pairs: list[tuple[str, str]] = []
@@ -301,18 +358,39 @@ def prepare_request(
 			prefix = f"{existing}; " if existing else ""
 			headers["Cookie"] = f"{prefix}{parameter.name}={value}"
 
-	if auth.mode == "basic":
-		encoded = base64.b64encode(f"{auth.username}:{auth.password}".encode("utf-8")).decode("ascii")
+	basic_values: dict[str, dict[str, str]] = {}
+	for auth_field in operation.auth_fields:
+		value = (values.get(auth_field.key) or "").strip()
+		if auth_field.kind == "basic_username":
+			item = basic_values.setdefault(auth_field.scheme_name, {})
+			item["username"] = value
+			continue
+		if auth_field.kind == "basic_password":
+			item = basic_values.setdefault(auth_field.scheme_name, {})
+			item["password"] = value
+			continue
+		if not value:
+			continue
+		if auth_field.kind == "bearer_token":
+			headers["Authorization"] = f"Bearer {value}"
+		elif auth_field.kind == "api_key_header":
+			headers[auth_field.target_name] = value
+		elif auth_field.kind == "api_key_query":
+			query_pairs.append((auth_field.target_name, value))
+		elif auth_field.kind == "api_key_cookie":
+			existing = headers.get("Cookie", "")
+			prefix = f"{existing}; " if existing else ""
+			headers["Cookie"] = f"{prefix}{auth_field.target_name}={value}"
+
+	for scheme_name, item in basic_values.items():
+		username = (item.get("username") or "").strip()
+		password = (item.get("password") or "").strip()
+		if not username and not password:
+			continue
+		if not username or not password:
+			raise ValueError(f"Missing basic auth value for scheme '{scheme_name}'")
+		encoded = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
 		headers["Authorization"] = f"Basic {encoded}"
-	elif auth.mode == "bearer":
-		if auth.token:
-			headers["Authorization"] = f"Bearer {auth.token}"
-	elif auth.mode == "header":
-		if auth.header_name and auth.header_value:
-			headers[auth.header_name] = auth.header_value
-	elif auth.mode == "query":
-		if auth.query_name and auth.query_value:
-			query_pairs.append((auth.query_name, auth.query_value))
 
 	body_value = (values.get("body") or "").strip()
 	payload: bytes | None = None
@@ -339,9 +417,8 @@ def execute_request(
 	base_url: str,
 	operation: Operation,
 	values: dict[str, str],
-	auth: AuthSettings,
 ) -> ResponseView:
-	target_url, headers, payload = prepare_request(base_url, operation, values, auth)
+	target_url, headers, payload = prepare_request(base_url, operation, values)
 	req = request.Request(target_url, data=payload, headers=headers, method=operation.method)
 	try:
 		with request.urlopen(req, timeout=30) as response:
@@ -372,22 +449,17 @@ class OpenApiTui:
 		self.operations: list[Operation] = []
 		self.operation_index = 0
 		self.request_index = 0
-		self.auth_index = 0
 		self.mode = "operations"
 		self.status_message = ""
 		self.response_view = ResponseView()
 		self.response_scroll = 0
 		self.form_values: dict[str, dict[str, str]] = {}
-		self.auth = AuthSettings()
-		self.last_screen_before_auth = "operations"
 
 	def load_document(self) -> None:
 		document = fetch_openapi_document(self.spec_url)
 		self.document_title = document.get("info", {}).get("title") or "OpenAPI"
 		self.request_base_url = resolve_request_base(document, self.spec_url, self.service_url)
 		self.operations = parse_operations(document)
-		if self.auth.mode == "none":
-			self.auth.mode = pick_default_auth_mode(document)
 		if not self.operations:
 			raise ValueError("OpenAPI document has no operations")
 		self.operation_index = min(self.operation_index, len(self.operations) - 1)
@@ -417,17 +489,13 @@ class OpenApiTui:
 				self.handle_operations_key(key)
 			elif self.mode == "request":
 				self.handle_request_key(key)
-			elif self.mode == "auth":
-				self.handle_auth_key(key)
 
 	def draw(self) -> None:
 		self.stdscr.erase()
 		if self.mode == "operations":
 			self.draw_operations_screen()
-		elif self.mode == "request":
-			self.draw_request_screen()
 		else:
-			self.draw_auth_screen()
+			self.draw_request_screen()
 		self.stdscr.refresh()
 
 	def draw_header(self, lines: list[str]) -> int:
@@ -446,7 +514,7 @@ class OpenApiTui:
 				f"API Client TUI | {self.document_title}",
 				f"Service: {self.request_base_url or self.service_url}",
 				f"Spec: {self.spec_url}",
-				"Arrows - select | Enter - open | a - auth | u - change URL | r - reload | q - quit",
+				"Arrows - select | Enter - open | u - change URL | r - reload | q - quit",
 			]
 		)
 		height, width = self.stdscr.getmaxyx()
@@ -484,6 +552,9 @@ class OpenApiTui:
 			key = parameter_key(parameter)
 			items.append(("field", key, render_parameter_label(parameter)))
 			values.setdefault(key, "")
+		for auth_field in operation.auth_fields:
+			items.append(("field", auth_field.key, auth_field.label))
+			values.setdefault(auth_field.key, "")
 		if operation.request_body:
 			items.append(("field", "body", f"body ({operation.request_body.content_type})"))
 			if operation.request_body.content_type == "application/json":
@@ -491,7 +562,6 @@ class OpenApiTui:
 			else:
 				values.setdefault("body", "")
 		items.append(("action", "send", "Send request"))
-		items.append(("action", "auth", "Edit auth"))
 		items.append(("action", "back", "Back to operations"))
 		return items
 
@@ -508,11 +578,13 @@ class OpenApiTui:
 		header_lines = [
 			f"{operation.method} {operation.path}",
 			f"Title: {operation.title}",
-			f"Auth: {self.auth.summary()} | Base URL: {self.request_base_url}",
+			f"Base URL: {self.request_base_url}",
 			"Arrows - move | Enter - edit/open | PgUp/PgDn - scroll response | r - reload | u - change URL | q - quit",
 		]
 		if operation.description:
 			header_lines.append(f"Info: {operation.description}")
+		if operation.auth_fields:
+			header_lines.append("Auth fields are editable directly in this form.")
 
 		header_end = self.draw_header(header_lines)
 		height, width = self.stdscr.getmaxyx()
@@ -528,7 +600,10 @@ class OpenApiTui:
 			kind, key, label = item
 			if kind == "field":
 				current_value = values.get(key, "")
-				display_value = current_value if current_value else "<empty>"
+				if key.endswith(":password") and current_value:
+					display_value = "*" * len(current_value)
+				else:
+					display_value = current_value if current_value else "<empty>"
 				text = f"{label}: {display_value}"
 			else:
 				text = f"[{label}]"
@@ -552,72 +627,6 @@ class OpenApiTui:
 				self.safe_addstr(response_start + index, 0, line[: max(width - 1, 1)])
 
 		self.draw_footer(self.status_message or "Idle")
-
-	def auth_items(self) -> list[tuple[str, str, str]]:
-		items: list[tuple[str, str, str]] = [("field", "mode", "Mode")]
-		if self.auth.mode == "basic":
-			items.extend(
-				[
-					("field", "username", "Username"),
-					("field", "password", "Password"),
-				]
-			)
-		elif self.auth.mode == "bearer":
-			items.append(("field", "token", "Token"))
-		elif self.auth.mode == "header":
-			items.extend(
-				[
-					("field", "header_name", "Header name"),
-					("field", "header_value", "Header value"),
-				]
-			)
-		elif self.auth.mode == "query":
-			items.extend(
-				[
-					("field", "query_name", "Query name"),
-					("field", "query_value", "Query value"),
-				]
-			)
-		items.append(("action", "save", "Save and go back"))
-		return items
-
-	def draw_auth_screen(self) -> None:
-		items = self.auth_items()
-		self.auth_index = min(self.auth_index, len(items) - 1)
-		header_end = self.draw_header(
-			[
-				"Authentication",
-				f"Current auth: {self.auth.summary()}",
-				"Arrows - move | Enter - edit/cycle | r - reload spec | u - change URL | q - quit",
-			]
-		)
-		height, width = self.stdscr.getmaxyx()
-		available_rows = max(height - header_end - 2, 1)
-		start_index = 0
-		if self.auth_index >= available_rows:
-			start_index = self.auth_index - available_rows + 1
-
-		visible_items = items[start_index : start_index + available_rows]
-		for offset, item in enumerate(visible_items):
-			row = header_end + offset
-			absolute_index = start_index + offset
-			kind, key, label = item
-			if kind == "field":
-				value = self.auth_field_value(key)
-				if key == "password" and value:
-					value = "*" * len(value)
-				text = f"{label}: {value or '<empty>'}"
-			else:
-				text = f"[{label}]"
-			attr = curses.A_REVERSE if absolute_index == self.auth_index else curses.A_NORMAL
-			self.safe_addstr(row, 0, text[: max(width - 1, 1)], attr)
-
-		self.draw_footer(self.status_message or "Idle")
-
-	def auth_field_value(self, key: str) -> str:
-		if key == "mode":
-			return self.auth.mode
-		return getattr(self.auth, key)
 
 	def handle_reload(self) -> None:
 		try:
@@ -666,10 +675,6 @@ class OpenApiTui:
 			self.request_index = 0
 			self.response_view = ResponseView()
 			self.response_scroll = 0
-		elif key in (ord("a"), ord("A")):
-			self.last_screen_before_auth = "operations"
-			self.mode = "auth"
-			self.auth_index = 0
 
 	def handle_request_key(self, key: int) -> None:
 		operation = self.current_operation()
@@ -685,67 +690,31 @@ class OpenApiTui:
 			self.request_index = max(self.request_index - 1, 0)
 		elif key == curses.KEY_DOWN:
 			self.request_index = min(self.request_index + 1, len(items) - 1)
-		elif key in (ord("a"), ord("A")):
-			self.last_screen_before_auth = "request"
-			self.mode = "auth"
-			self.auth_index = 0
 		elif key in (curses.KEY_ENTER, 10, 13):
-			kind, item_key, _ = items[self.request_index]
+			kind, item_key, label = items[self.request_index]
 			if kind == "field":
-				self.edit_request_field(operation, item_key)
+				self.edit_request_field(operation, item_key, label)
 			elif item_key == "send":
 				self.send_request(operation)
-			elif item_key == "auth":
-				self.last_screen_before_auth = "request"
-				self.mode = "auth"
-				self.auth_index = 0
 			elif item_key == "back":
 				self.mode = "operations"
 				self.request_index = 0
 
-	def handle_auth_key(self, key: int) -> None:
-		items = self.auth_items()
-		if key == curses.KEY_UP:
-			self.auth_index = max(self.auth_index - 1, 0)
-		elif key == curses.KEY_DOWN:
-			self.auth_index = min(self.auth_index + 1, len(items) - 1)
-		elif key in (curses.KEY_ENTER, 10, 13):
-			kind, item_key, _ = items[self.auth_index]
-			if kind == "field":
-				self.edit_auth_field(item_key)
-			elif item_key == "save":
-				self.mode = self.last_screen_before_auth
-				self.status_message = f"Auth updated: {self.auth.summary()}"
-
-	def edit_request_field(self, operation: Operation, item_key: str) -> None:
+	def edit_request_field(self, operation: Operation, item_key: str, label: str) -> None:
 		values = self.form_values.setdefault(operation.key, {})
 		existing = values.get(item_key, "")
-		updated = self.prompt_input(item_key, existing)
+		prompt_label = "body" if item_key == "body" else label
+		updated = self.prompt_input(prompt_label, existing)
 		if updated is None:
-			self.status_message = f"Edit cancelled: {item_key}"
+			self.status_message = f"Edit cancelled: {prompt_label}"
 			return
 		values[item_key] = updated
-		self.status_message = f"Updated {item_key}"
-
-	def edit_auth_field(self, item_key: str) -> None:
-		if item_key == "mode":
-			current_index = AUTH_MODES.index(self.auth.mode)
-			self.auth.mode = AUTH_MODES[(current_index + 1) % len(AUTH_MODES)]
-			self.auth_index = 0
-			self.status_message = f"Auth mode: {self.auth.mode}"
-			return
-		existing = getattr(self.auth, item_key)
-		updated = self.prompt_input(item_key, existing)
-		if updated is None:
-			self.status_message = f"Edit cancelled: {item_key}"
-			return
-		setattr(self.auth, item_key, updated)
-		self.status_message = f"Updated {item_key}"
+		self.status_message = f"Updated {prompt_label}"
 
 	def send_request(self, operation: Operation) -> None:
 		values = self.form_values.setdefault(operation.key, {})
 		try:
-			self.response_view = execute_request(self.request_base_url, operation, values, self.auth)
+			self.response_view = execute_request(self.request_base_url, operation, values)
 			self.response_scroll = 0
 			self.status_message = "Request finished"
 		except json.JSONDecodeError as exc:
