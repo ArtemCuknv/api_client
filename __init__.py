@@ -1,0 +1,1 @@
+"""OpenAPI TUI client package."""
