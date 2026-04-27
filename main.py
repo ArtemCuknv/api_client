@@ -13,7 +13,7 @@ from urllib import error, parse, request
 HTTP_METHODS = ("get", "post", "put", "patch", "delete", "options", "head")
 AUTH_MODES = ("none", "basic", "bearer", "header", "query")
 PROMPT_LINE_OFFSET = 2
-
+RESPONSE_SCROLL_STEP = 5
 
 @dataclass(slots=True)
 class ParameterSpec:
@@ -376,6 +376,7 @@ class OpenApiTui:
 		self.mode = "operations"
 		self.status_message = ""
 		self.response_view = ResponseView()
+		self.response_scroll = 0
 		self.form_values: dict[str, dict[str, str]] = {}
 		self.auth = AuthSettings()
 		self.last_screen_before_auth = "operations"
@@ -508,7 +509,7 @@ class OpenApiTui:
 			f"{operation.method} {operation.path}",
 			f"Title: {operation.title}",
 			f"Auth: {self.auth.summary()} | Base URL: {self.request_base_url}",
-			"Arrows - move | Enter - edit/open | r - reload | u - change URL | q - quit",
+			"Arrows - move | Enter - edit/open | PgUp/PgDn - scroll response | r - reload | u - change URL | q - quit",
 		]
 		if operation.description:
 			header_lines.append(f"Info: {operation.description}")
@@ -536,11 +537,18 @@ class OpenApiTui:
 
 		response_start = header_end + list_rows + 1
 		if response_start < height - 1:
-			self.safe_addstr(response_start, 0, "Response:")
 			response_lines = self.response_view.to_lines(max(width - 2, 20))
 			max_response_rows = max(height - response_start - 2, 1)
-			truncated = response_lines[:max_response_rows]
-			for index, line in enumerate(truncated, start=1):
+			max_scroll = max(len(response_lines) - max_response_rows, 0)
+			self.response_scroll = min(self.response_scroll, max_scroll)
+			visible_lines = response_lines[self.response_scroll : self.response_scroll + max_response_rows]
+			title = "Response:"
+			if max_scroll > 0:
+				start_line = self.response_scroll + 1
+				end_line = self.response_scroll + len(visible_lines)
+				title = f"Response ({start_line}-{end_line}/{len(response_lines)}):"
+			self.safe_addstr(response_start, 0, title)
+			for index, line in enumerate(visible_lines, start=1):
 				self.safe_addstr(response_start + index, 0, line[: max(width - 1, 1)])
 
 		self.draw_footer(self.status_message or "Idle")
@@ -657,6 +665,7 @@ class OpenApiTui:
 			self.mode = "request"
 			self.request_index = 0
 			self.response_view = ResponseView()
+			self.response_scroll = 0
 		elif key in (ord("a"), ord("A")):
 			self.last_screen_before_auth = "operations"
 			self.mode = "auth"
@@ -668,7 +677,11 @@ class OpenApiTui:
 			self.mode = "operations"
 			return
 		items = self.request_items(operation)
-		if key == curses.KEY_UP:
+		if key == curses.KEY_PPAGE:
+			self.response_scroll = max(self.response_scroll - RESPONSE_SCROLL_STEP, 0)
+		elif key == curses.KEY_NPAGE:
+			self.response_scroll += RESPONSE_SCROLL_STEP
+		elif key == curses.KEY_UP:
 			self.request_index = max(self.request_index - 1, 0)
 		elif key == curses.KEY_DOWN:
 			self.request_index = min(self.request_index + 1, len(items) - 1)
@@ -733,6 +746,7 @@ class OpenApiTui:
 		values = self.form_values.setdefault(operation.key, {})
 		try:
 			self.response_view = execute_request(self.request_base_url, operation, values, self.auth)
+			self.response_scroll = 0
 			self.status_message = "Request finished"
 		except json.JSONDecodeError as exc:
 			self.status_message = f"Invalid JSON body: {exc.msg}"
